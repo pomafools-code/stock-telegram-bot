@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 import os
 import pandas as pd
 import pytz
@@ -47,7 +48,6 @@ def load_watchlist():
         if response.status_code == 200:
             data = response.json()
             record = data.get("record", {})
-            # ป้องกันกรณี JSONBin ซ้อน Key ชื่อ 'watchlist'
             if "watchlist" in record:
                 return record["watchlist"]
             if isinstance(record, dict):
@@ -59,64 +59,136 @@ def load_watchlist():
     return {}
 
 
+def load_color_state():
+    """โหลดสถานะสีล่าสุดของหุ้น"""
+    state_file = "stock_colors_state.json"
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_color_state(state):
+    """บันทึกสถานะสีล่าสุดลงไฟล์"""
+    state_file = "stock_colors_state.json"
+    try:
+        with open(state_file, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"❌ บันทึก Color State ไม่สำเร็จ: {e}")
+
+
+def check_color_change(symbol, current_close, prev_close):
+    """ตรวจจับการเปลี่ยนสีของหุ้น (เขียว <-> แดง)"""
+    if prev_close == 0:
+        return None
+
+    change_pct = ((current_close - prev_close) / prev_close) * 100
+    current_color = "GREEN" if change_pct >= 0 else "RED"
+
+    color_state = load_color_state()
+    last_color = color_state.get(symbol)
+
+    alert_msg = None
+
+    if last_color and last_color != current_color:
+        if current_color == "RED":
+            alert_msg = (
+                f"🚨 **เตือนหุ้นเปลี่ยนสี (เขียว 🟢 ➔ แดง 🔴)**: หุ้น {symbol}\n"
+                f"- ราคาปัจจุบัน: ${current_close:.2f} ({change_pct:+.2f}%)\n"
+                f"- ราคาปิดวันก่อน: ${prev_close:.2f}\n"
+                f"[ByPomSwingtrader]"
+            )
+        elif current_color == "GREEN":
+            alert_msg = (
+                f"✳️ **เตือนหุ้นเปลี่ยนสี (แดง 🔴 ➔ เขียว 🟢)**: หุ้น {symbol}\n"
+                f"- ราคาปัจจุบัน: ${current_close:.2f} ({change_pct:+.2f}%)\n"
+                f"- ราคาปิดวันก่อน: ${prev_close:.2f}\n"
+                f"[ByPomSwingtrader]"
+            )
+
+    color_state[symbol] = current_color
+    save_color_state(color_state)
+    return alert_msg
+
+
+def safe_float(val):
+    """แปลงค่าตัวเลขให้ปลอดภัย ป้องกันการเปรียบเทียบราคาผิดพลาด"""
+    if val in [None, "-", "", "None", "null"]:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
 def check_full_strategy(symbol, data):
-    """สแกนเงื่อนไขราคา Entry, TP, SL"""
+    """สแกนเงื่อนไขราคา Entry, TP, SL และการเปลี่ยนสีอย่างละเอียด"""
     try:
         side = str(data.get("side", "LONG")).upper()
 
-        entry_price = float(data["entry"]) if data.get("entry") not in [None, "-", ""] else None
-        tp_price = float(data["tp"]) if data.get("tp") not in [None, "-", ""] else None
-        sl_price = float(data["sl"]) if data.get("sl") not in [None, "-", ""] else None
+        entry_price = safe_float(data.get("entry"))
+        tp_price = safe_float(data.get("tp"))
+        sl_price = safe_float(data.get("sl"))
 
-        df = yf.Ticker(symbol).history(period="6mo")
-        if df.empty or len(df) < 10:
+        df = yf.Ticker(symbol).history(period="5d")
+        if df.empty or len(df) < 2:
             print(f"⚠️ หุ้น {symbol}: ไม่พบข้อมูลราคา")
             return None
 
-        current_close = df["Close"].iloc[-1]
+        current_close = float(df["Close"].iloc[-1])
+        prev_close = float(df["Close"].iloc[-2])
         alerts = []
 
-        # 1. ตรวจสอบเงื่อนไข Entry
+        # 1. เช็กหุ้นเปลี่ยนสี (เขียว <-> แดง)
+        color_alert = check_color_change(symbol, current_close, prev_close)
+        if color_alert:
+            alerts.append(color_alert)
+
+        # 2. เช็กราคา ENTRY (เช่น ตั้งไว้ 5 แล้วราคาลงมาถึงหรือต่ำกว่า 5)
         if entry_price is not None:
             if side == "LONG" and current_close <= entry_price:
                 alerts.append(
-                    f"🔔 ถึงราคาเข้าซื้อ ENTRY LONG: หุ้น {symbol}\n"
-                    f"- ราคาปัจจุบัน (${current_close:.2f}) ลงมาถึงจุดเข้าซื้อ (${entry_price:.2f})\n"
+                    f"🔔 **ถึงราคาเข้าซื้อ ENTRY LONG**: หุ้น {symbol}\n"
+                    f"- ราคาปัจจุบัน (${current_close:.2f}) ถึงจุดเข้าซื้อ (${entry_price:.2f})\n"
                     f"[ByPomSwingtrader]"
                 )
             elif side == "SHORT" and current_close >= entry_price:
                 alerts.append(
-                    f"🔔 ถึงราคาเข้าชอร์ต ENTRY SHORT: หุ้น {symbol}\n"
-                    f"- ราคาปัจจุบัน (${current_close:.2f}) ขึ้นมาถึงจุดเข้าชอร์ต (${entry_price:.2f})\n"
+                    f"🔔 **ถึงราคาเข้าชอร์ต ENTRY SHORT**: หุ้น {symbol}\n"
+                    f"- ราคาปัจจุบัน (${current_close:.2f}) ถึงจุดเข้าชอร์ต (${entry_price:.2f})\n"
                     f"[ByPomSwingtrader]"
                 )
 
-        # 2. ตรวจสอบเงื่อนไข Take Profit (TP)
+        # 3. เช็กราคา TAKE PROFIT (TP)
         if tp_price is not None:
             if side == "LONG" and current_close >= tp_price:
                 alerts.append(
-                    f"🎯 ถึงเป้า Take Profit (TP) LONG: หุ้น {symbol}\n"
+                    f"🎯 **ถึงเป้า Take Profit (TP) LONG**: หุ้น {symbol}\n"
                     f"- ราคาปัจจุบัน (${current_close:.2f}) ชนเป้า TP (${tp_price:.2f})\n"
                     f"[ByPomSwingtrader]"
                 )
             elif side == "SHORT" and current_close <= tp_price:
                 alerts.append(
-                    f"🎯 ถึงเป้า Take Profit (TP) SHORT: หุ้น {symbol}\n"
+                    f"🎯 **ถึงเป้า Take Profit (TP) SHORT**: หุ้น {symbol}\n"
                     f"- ราคาปัจจุบัน (${current_close:.2f}) ชนเป้า TP (${tp_price:.2f})\n"
                     f"[ByPomSwingtrader]"
                 )
 
-        # 3. ตรวจสอบเงื่อนไข Stop Loss (SL)
+        # 4. เช็กราคา STOP LOSS (SL)
         if sl_price is not None:
             if side == "LONG" and current_close <= sl_price:
                 alerts.append(
-                    f"🛑 ชนจุด Stop Loss (SL) LONG: หุ้น {symbol}\n"
+                    f"🛑 **ชนจุด Stop Loss (SL) LONG**: หุ้น {symbol}\n"
                     f"- ราคาปัจจุบัน (${current_close:.2f}) หลุด SL (${sl_price:.2f})\n"
                     f"[ByPomSwingtrader]"
                 )
             elif side == "SHORT" and current_close >= sl_price:
                 alerts.append(
-                    f"🛑 ชนจุด Stop Loss (SL) SHORT: หุ้น {symbol}\n"
+                    f"🛑 **ชนจุด Stop Loss (SL) SHORT**: หุ้น {symbol}\n"
                     f"- ราคาปัจจุบัน (${current_close:.2f}) ทะลุ SL (${sl_price:.2f})\n"
                     f"[ByPomSwingtrader]"
                 )
@@ -129,7 +201,7 @@ def check_full_strategy(symbol, data):
 
 
 def get_daily_summary(watchlist):
-    """สร้างข้อความรายงานสรุปราคาหุ้น"""
+    """สร้างข้อความรายงานสรุปราคาหุ้นประจำรอบ"""
     summary_msgs = []
     tz = pytz.timezone("Asia/Bangkok")
     now_str = datetime.now(tz).strftime("%d/%m/%Y %H:%M")
@@ -145,8 +217,8 @@ def get_daily_summary(watchlist):
 
             df = yf.Ticker(symbol).history(period="5d")
             if len(df) >= 2:
-                current_close = df["Close"].iloc[-1]
-                prev_close = df["Close"].iloc[-2]
+                current_close = float(df["Close"].iloc[-1])
+                prev_close = float(df["Close"].iloc[-2])
                 change_pct = ((current_close - prev_close) / prev_close) * 100
                 status_icon = "🟢" if change_pct >= 0 else "🔴"
 
@@ -157,7 +229,7 @@ def get_daily_summary(watchlist):
                 )
                 summary_msgs.append(msg)
             elif len(df) == 1:
-                current_close = df["Close"].iloc[-1]
+                current_close = float(df["Close"].iloc[-1])
                 msg = (
                     f"🔹 หุ้น {symbol} ({side})\n"
                     f"- ราคาปัจจุบัน: ${current_close:.2f}\n"
@@ -171,7 +243,7 @@ def get_daily_summary(watchlist):
 
 
 def should_send_summary(current_hour, today_str):
-    """ตรวจสอบช่วงเวลา 06.00-08.59 และ 17.00-19.59 พร้อมป้องกันการส่งซ้ำ"""
+    """ตรวจสอบช่วงเวลา 06.00-08.59 น. และ 17.00-19.59 น."""
     flag_file = f"summary_sent_{today_str}.txt"
 
     period = None
@@ -180,17 +252,14 @@ def should_send_summary(current_hour, today_str):
     elif 17 <= current_hour < 20:
         period = "EVENING"
 
-    # ถ้านอกช่วงเวลาส่งสรุป ให้ข้าม
     if not period:
         return False, None
 
-    # ตรวจสอบประวัติการส่งของวันนี้
     sent_periods = []
     if os.path.exists(flag_file):
         with open(flag_file, "r") as f:
             sent_periods = f.read().splitlines()
 
-    # หากยังไม่เคยส่งในรอบนี้ ให้ผ่านและลงบันทึก
     if period not in sent_periods:
         with open(flag_file, "a") as f:
             f.write(f"{period}\n")
@@ -211,26 +280,21 @@ if __name__ == "__main__":
 
         print(f"⏰ เวลาปัจจุบัน (Bangkok): {now.strftime('%H:%M:%S')}")
 
-        # 1. ตรวจสอบการส่งรายงานสรุป (ช่วงเช้า 06-08 น. / ช่วงเย็น 17-19 น.)
+        # 1. รายงานสรุปประจำรอบ (เช้า 06.00-08.59 น. / เย็น 17.00-19.59 น.)
         send_flag, period_name = should_send_summary(current_hour, today_str)
         if send_flag:
             print(f"📢 กำลังส่งรายงานสรุปหุ้นประจำรอบช่วงเวลา ({period_name})...")
             summary_text = get_daily_summary(watchlist)
             send_msg(summary_text)
-        else:
-            if period_name:
-                print(f"ℹ️️ รอบ {period_name} ของวันนี้ ได้ทำการส่งสรุปไปเรียบร้อยแล้ว")
-            else:
-                print("ℹ️ นอกช่วงเวลาการส่งรายงานสรุปประจำรอบ (06.00-08.59 น. / 17.00-19.59 น.)")
 
-        # 2. สแกนเงื่อนไขราคาเข้า/ออก หุ้นแต่ละตัว
-        print(f"🔍 กำลังสแกนเงื่อนไขหุ้นจำนวน {len(watchlist)} ตัว...")
+        # 2. สแกนราคาทุกตัว (Entry, TP, SL, สีเปลี่ยน)
+        print(f"🔍 กำลังสแกนราคาหุ้นจำนวน {len(watchlist)} ตัว...")
         for symbol, data in watchlist.items():
             res = check_full_strategy(symbol, data)
             if res:
                 send_msg(res)
-                print(f"✅ ส่งการแจ้งเตือนเงื่อนไขหุ้น {symbol} เรียบร้อย")
+                print(f"✅ ส่งการแจ้งเตือนระดับราคา/สีเปลี่ยนของหุ้น {symbol} เรียบร้อย")
             else:
-                print(f"ℹ️ หุ้น {symbol}: ยังไม่เข้าเงื่อนไขแจ้งเตือน")
+                print(f"ℹ️ หุ้น {symbol}: ราคายังไม่แตะระดับ Entry/TP/SL และไม่มีการเปลี่ยนสี")
     else:
         print("❌ ไม่พบรายชื่อหุ้นใน Cloud หรือดึงข้อมูล JSONBin ไม่สำเร็จ")
