@@ -5,18 +5,25 @@ import pytz
 import requests
 import yfinance as yf
 
-# ดึงค่าจาก Environment Variables
+# ==========================================
+# API Keys & Credentials
+# ==========================================
 TOKEN = os.getenv("TELEGRAM_TOKEN", "8716643800:AAFoN_YyOf1hFLUMskEDtfBtQ2NCoEDDe3A")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8735795390")
 JSONBIN_BIN_ID = os.getenv("JSONBIN_BIN_ID", "6a93da60da38895dfe223f00")
-JSONBIN_MASTER_KEY = os.getenv("JSONBIN_MASTER_KEY", "$2a$10$ABZMwjVjxKfLtpMmhb4uUeL4eqgB1rrZT9UjTpRIUhgQd9.3oUHo2")
+JSONBIN_MASTER_KEY = os.getenv(
+    "JSONBIN_MASTER_KEY",
+    "$2a$10$ABZMwjVjxKfLtpMmhb4uUeL4eqgB1rrZT9UjTpRIUhgQd9.3oUHo2"
+)
 
 headers = {
     "Content-Type": "application/json",
     "X-Master-Key": JSONBIN_MASTER_KEY,
 }
 
+
 def send_msg(text):
+    """ฟังก์ชันส่งข้อความไปยัง Telegram"""
     if not text:
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -31,87 +38,88 @@ def send_msg(text):
     except Exception as e:
         print(f"❌ Error sending message: {e}")
 
+
 def load_watchlist():
+    """ดึงรายชื่อหุ้นจาก JSONBin"""
     try:
         url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
             record = data.get("record", {})
-            # ป้องกันกรณี JSONBin ซ้อน Key คำว่า 'watchlist' อีกที
+            # ป้องกันกรณี JSONBin ซ้อน Key ชื่อ 'watchlist'
             if "watchlist" in record:
                 return record["watchlist"]
             if isinstance(record, dict):
                 return record
         else:
-            print(f"❌ JSONBin Error Status: {response.status_code} - {response.text}")
+            print(f"❌ JSONBin Error Status: {response.status_code}")
     except Exception as e:
         print(f"❌ Error loading from JSONBin: {e}")
     return {}
 
-def generate_kagi_signals(df, reversal_pct=0.03):
-    if df.empty or len(df) < 10:
-        return "NEUTRAL", 0.0
-
-    prices = df["Close"].dropna()
-    current_price = prices.iloc[-1]
-
-    trend = "BUY"
-    peak = prices.iloc[0]
-    trough = prices.iloc[0]
-
-    for p in prices:
-        if trend == "BUY":
-            if p > peak:
-                peak = p
-            elif p <= peak * (1 - reversal_pct):
-                trend = "SELL"
-                trough = p
-        else:
-            if p < trough:
-                trough = p
-            elif p >= trough * (1 + reversal_pct):
-                trend = "BUY"
-                peak = p
-
-    return trend, current_price
 
 def check_full_strategy(symbol, data):
+    """สแกนเงื่อนไขราคา Entry, TP, SL"""
     try:
         side = str(data.get("side", "LONG")).upper()
-        
+
         entry_price = float(data["entry"]) if data.get("entry") not in [None, "-", ""] else None
         tp_price = float(data["tp"]) if data.get("tp") not in [None, "-", ""] else None
         sl_price = float(data["sl"]) if data.get("sl") not in [None, "-", ""] else None
 
         df = yf.Ticker(symbol).history(period="6mo")
         if df.empty or len(df) < 10:
-            print(f"⚠️ ไม่สามารถดึงข้อมูลหุ้น {symbol} ได้")
+            print(f"⚠️ หุ้น {symbol}: ไม่พบข้อมูลราคา")
             return None
 
         current_close = df["Close"].iloc[-1]
         alerts = []
 
-        # 1. เงื่อนไข ENTRY
+        # 1. ตรวจสอบเงื่อนไข Entry
         if entry_price is not None:
             if side == "LONG" and current_close <= entry_price:
-                alerts.append(f"🔔 ถึงราคาเข้าซื้อ ENTRY LONG: หุ้น {symbol}\n- ราคาปัจจุบัน (${current_close:.2f}) ลงมาถึงจุดเข้าซื้อ (${entry_price:.2f})\n[ByPomSwingtrader]")
+                alerts.append(
+                    f"🔔 ถึงราคาเข้าซื้อ ENTRY LONG: หุ้น {symbol}\n"
+                    f"- ราคาปัจจุบัน (${current_close:.2f}) ลงมาถึงจุดเข้าซื้อ (${entry_price:.2f})\n"
+                    f"[ByPomSwingtrader]"
+                )
             elif side == "SHORT" and current_close >= entry_price:
-                alerts.append(f"🔔 ถึงราคาเข้าชอร์ต ENTRY SHORT: หุ้น {symbol}\n- ราคาปัจจุบัน (${current_close:.2f}) ขึ้นมาถึงจุดเข้าชอร์ต (${entry_price:.2f})\n[ByPomSwingtrader]")
+                alerts.append(
+                    f"🔔 ถึงราคาเข้าชอร์ต ENTRY SHORT: หุ้น {symbol}\n"
+                    f"- ราคาปัจจุบัน (${current_close:.2f}) ขึ้นมาถึงจุดเข้าชอร์ต (${entry_price:.2f})\n"
+                    f"[ByPomSwingtrader]"
+                )
 
-        # 2. เงื่อนไข Take Profit (TP)
+        # 2. ตรวจสอบเงื่อนไข Take Profit (TP)
         if tp_price is not None:
             if side == "LONG" and current_close >= tp_price:
-                alerts.append(f"🎯 ถึงเป้า Take Profit (TP) LONG: หุ้น {symbol}\n- ราคาปัจจุบัน (${current_close:.2f}) ชนเป้า TP (${tp_price:.2f})\n[ByPomSwingtrader]")
+                alerts.append(
+                    f"🎯 ถึงเป้า Take Profit (TP) LONG: หุ้น {symbol}\n"
+                    f"- ราคาปัจจุบัน (${current_close:.2f}) ชนเป้า TP (${tp_price:.2f})\n"
+                    f"[ByPomSwingtrader]"
+                )
             elif side == "SHORT" and current_close <= tp_price:
-                alerts.append(f"🎯 ถึงเป้า Take Profit (TP) SHORT: หุ้น {symbol}\n- ราคาปัจจุบัน (${current_close:.2f}) ชนเป้า TP (${tp_price:.2f})\n[ByPomSwingtrader]")
+                alerts.append(
+                    f"🎯 ถึงเป้า Take Profit (TP) SHORT: หุ้น {symbol}\n"
+                    f"- ราคาปัจจุบัน (${current_close:.2f}) ชนเป้า TP (${tp_price:.2f})\n"
+                    f"[ByPomSwingtrader]"
+                )
 
-        # 3. เงื่อนไข Stop Loss (SL)
+        # 3. ตรวจสอบเงื่อนไข Stop Loss (SL)
         if sl_price is not None:
             if side == "LONG" and current_close <= sl_price:
-                alerts.append(f"🛑 ชนจุด Stop Loss (SL) LONG: หุ้น {symbol}\n- ราคาปัจจุบัน (${current_close:.2f}) หลุด SL (${sl_price:.2f})\n[ByPomSwingtrader]")
+                alerts.append(
+                    f"🛑 ชนจุด Stop Loss (SL) LONG: หุ้น {symbol}\n"
+                    f"- ราคาปัจจุบัน (${current_close:.2f}) หลุด SL (${sl_price:.2f})\n"
+                    f"[ByPomSwingtrader]"
+                )
             elif side == "SHORT" and current_close >= sl_price:
-                alerts.append(f"🛑 ชนจุด Stop Loss (SL) SHORT: หุ้น {symbol}\n- ราคาปัจจุบัน (${current_close:.2f}) ทะลุ SL (${sl_price:.2f})\n[ByPomSwingtrader]")
+                alerts.append(
+                    f"🛑 ชนจุด Stop Loss (SL) SHORT: หุ้น {symbol}\n"
+                    f"- ราคาปัจจุบัน (${current_close:.2f}) ทะลุ SL (${sl_price:.2f})\n"
+                    f"[ByPomSwingtrader]"
+                )
 
         return "\n\n".join(alerts) if alerts else None
 
@@ -119,7 +127,9 @@ def check_full_strategy(symbol, data):
         print(f"❌ Error processing {symbol}: {e}")
         return None
 
+
 def get_daily_summary(watchlist):
+    """สร้างข้อความรายงานสรุปราคาหุ้น"""
     summary_msgs = []
     tz = pytz.timezone("Asia/Bangkok")
     now_str = datetime.now(tz).strftime("%d/%m/%Y %H:%M")
@@ -155,29 +165,66 @@ def get_daily_summary(watchlist):
                 )
                 summary_msgs.append(msg)
         except Exception as e:
-            summary_msgs.append(f"❌ หุ้น {symbol}: ไม่สามารถดึงข้อมูลได้ ({e})")
+            summary_msgs.append(f"❌ หุ้น {symbol}: ดึงข้อมูลไม่ได้ ({e})")
 
     return "\n\n".join(summary_msgs)
+
+
+def should_send_summary(current_hour, today_str):
+    """ตรวจสอบช่วงเวลา 06.00-08.59 และ 17.00-19.59 พร้อมป้องกันการส่งซ้ำ"""
+    flag_file = f"summary_sent_{today_str}.txt"
+
+    period = None
+    if 6 <= current_hour < 9:
+        period = "MORNING"
+    elif 17 <= current_hour < 20:
+        period = "EVENING"
+
+    # ถ้านอกช่วงเวลาส่งสรุป ให้ข้าม
+    if not period:
+        return False, None
+
+    # ตรวจสอบประวัติการส่งของวันนี้
+    sent_periods = []
+    if os.path.exists(flag_file):
+        with open(flag_file, "r") as f:
+            sent_periods = f.read().splitlines()
+
+    # หากยังไม่เคยส่งในรอบนี้ ให้ผ่านและลงบันทึก
+    if period not in sent_periods:
+        with open(flag_file, "a") as f:
+            f.write(f"{period}\n")
+        return True, period
+
+    return False, period
+
 
 if __name__ == "__main__":
     watchlist = load_watchlist()
     print(f"📌 ดึง Watchlist ได้ทั้งหมด: {len(watchlist)} รายการ")
-    
+
     if watchlist:
-        # ทดลองส่งข้อความทดสอบการเชื่อมต่อ Telegram
-        # send_msg("🧪 ทดสอบการเชื่อมต่อระบบแจ้งเตือน Telegram")
-
         tz = pytz.timezone("Asia/Bangkok")
-        current_hour = datetime.now(tz).hour
-        print(f"⏰ เวลาปัจจุบัน (Bangkok): {datetime.now(tz).strftime('%H:%M:%S')}")
+        now = datetime.now(tz)
+        current_hour = now.hour
+        today_str = now.strftime("%Y-%m-%d")
 
-        # รันสรุปประจำรอบ (เช็กช่วงเวลา)
-        if current_hour in [6, 18]:
-            print(f"กำลังส่งรายงานสรุปหุ้นรอบเวลา {current_hour}:00 น. ...")
+        print(f"⏰ เวลาปัจจุบัน (Bangkok): {now.strftime('%H:%M:%S')}")
+
+        # 1. ตรวจสอบการส่งรายงานสรุป (ช่วงเช้า 06-08 น. / ช่วงเย็น 17-19 น.)
+        send_flag, period_name = should_send_summary(current_hour, today_str)
+        if send_flag:
+            print(f"📢 กำลังส่งรายงานสรุปหุ้นประจำรอบช่วงเวลา ({period_name})...")
             summary_text = get_daily_summary(watchlist)
             send_msg(summary_text)
+        else:
+            if period_name:
+                print(f"ℹ️️ รอบ {period_name} ของวันนี้ ได้ทำการส่งสรุปไปเรียบร้อยแล้ว")
+            else:
+                print("ℹ️ นอกช่วงเวลาการส่งรายงานสรุปประจำรอบ (06.00-08.59 น. / 17.00-19.59 น.)")
 
-        print(f"กำลังสแกนเงื่อนไขหุ้นจำนวน {len(watchlist)} ตัว...")
+        # 2. สแกนเงื่อนไขราคาเข้า/ออก หุ้นแต่ละตัว
+        print(f"🔍 กำลังสแกนเงื่อนไขหุ้นจำนวน {len(watchlist)} ตัว...")
         for symbol, data in watchlist.items():
             res = check_full_strategy(symbol, data)
             if res:
@@ -186,4 +233,4 @@ if __name__ == "__main__":
             else:
                 print(f"ℹ️ หุ้น {symbol}: ยังไม่เข้าเงื่อนไขแจ้งเตือน")
     else:
-        print("❌ ไม่พบรายชื่อหุ้นใน Cloud หรือโครงสร้าง JSONBin ไม่ถูกต้อง")
+        print("❌ ไม่พบรายชื่อหุ้นใน Cloud หรือดึงข้อมูล JSONBin ไม่สำเร็จ")
