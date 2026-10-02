@@ -1,7 +1,6 @@
 from datetime import datetime
 import json
 import os
-import pandas as pd
 import pytz
 import requests
 import yfinance as yf
@@ -12,8 +11,6 @@ import yfinance as yf
 TOKEN = os.getenv("TELEGRAM_TOKEN", "8716643800:AAFoN_YyOf1hFLUMskEDtfBtQ2NCoEDDe3A")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8735795390")
 JSONBIN_BIN_ID = os.getenv("JSONBIN_BIN_ID", "6a93da60da38895dfe223f00")
-
-# อัปเดต X-MASTER-KEY ตรงตามหน้าจอ JSONBin ของเจ้านายแล้วครับ
 JSONBIN_MASTER_KEY = os.getenv(
     "JSONBIN_MASTER_KEY",
     "$2a$10$NjCsm/l7lP0JrFPiwIL4wev2QO.gRIw6eR3PBHEy0Q/BjG9b4Vf8C",
@@ -42,51 +39,34 @@ def send_msg(text):
         print(f"❌ Error sending message: {e}")
 
 
-def load_watchlist():
-    """ดึงรายชื่อหุ้นจาก JSONBin"""
+def load_jsonbin_data():
+    """ดึงข้อมูลทั้งหมดจาก JSONBin (รวมทั้ง Watchlist, State และ Summary Tracker)"""
     try:
         url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
-            data = response.json()
-            record = data.get("record", {})
-            if "watchlist" in record:
-                return record["watchlist"]
-            if isinstance(record, dict):
-                return record
+            return response.json().get("record", {})
         else:
-            print(
-                f"❌ JSONBin Error Status: {response.status_code} - ตรวจสอบ Key หรือ Bin ID"
-            )
+            print(f"❌ JSONBin Read Error Status: {response.status_code}")
     except Exception as e:
         print(f"❌ Error loading from JSONBin: {e}")
     return {}
 
 
-def load_color_state():
-    """โหลดสถานะสีและการแจ้งเตือนย้อนหลัง"""
-    state_file = "stock_colors_state.json"
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-
-def save_color_state(state):
-    """บันทึกสถานะลงไฟล์"""
-    state_file = "stock_colors_state.json"
+def save_jsonbin_data(data):
+    """บันทึกข้อมูลทั้งหมดกลับไปยัง JSONBin เพื่อแก้ปัญหา State หายบน GitHub Actions"""
     try:
-        with open(state_file, "w") as f:
-            json.dump(state, f, indent=2)
+        url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+        response = requests.put(url, headers=headers, json=data, timeout=10)
+        if response.status_code == 200:
+            print("✅ บันทึก State กลับขึ้น JSONBin สำเร็จ")
+        else:
+            print(f"❌ JSONBin Save Error Status: {response.status_code}")
     except Exception as e:
-        print(f"❌ บันทึก State ไม่สำเร็จ: {e}")
+        print(f"❌ Error saving to JSONBin: {e}")
 
 
 def safe_float(val):
-    """แปลงค่าตัวเลขให้ปลอดภัย"""
     if val in [None, "-", "", "None", "null"]:
         return None
     try:
@@ -96,14 +76,13 @@ def safe_float(val):
 
 
 def check_full_strategy(symbol, data, state):
-    """สแกนเงื่อนไขราคา Entry, TP, SL และการเปลี่ยนสี"""
     try:
         side = str(data.get("side", "LONG")).upper()
         entry_price = safe_float(data.get("entry"))
         tp_price = safe_float(data.get("tp"))
         sl_price = safe_float(data.get("sl"))
 
-        # ดึงราคาหุ้นย้อนหลัง 7 วันเพื่อป้องกันติดวันหยุดเสาร์-อาทิตย์
+        # ดึงราคา 7 วันป้องกันช่วงวันหยุด
         df = yf.Ticker(symbol).history(period="7d")
         if df.empty or len(df) < 2:
             print(f"⚠️ หุ้น {symbol}: ไม่พบข้อมูลราคาจาก yfinance")
@@ -122,7 +101,7 @@ def check_full_strategy(symbol, data, state):
         last_color = symbol_state.get("color")
         alerts = []
 
-        # 1. เช็กการเปลี่ยนสี (เขียว <-> แดง)
+        # 1. เช็กหุ้นเปลี่ยนสี (เขียว <-> แดง)
         if last_color and last_color != current_color:
             if current_color == "RED":
                 alerts.append(
@@ -139,7 +118,7 @@ def check_full_strategy(symbol, data, state):
                     f"[ByPomSwingtrader]"
                 )
 
-        # 2. เช็กราคา ENTRY (แจ้งเตือนครั้งแรกเมื่อเข้าเงื่อนไข)
+        # 2. เช็กราคา Entry (แจ้งเตือนแค่ครั้งเดียวจนกว่าจะแก้ค่า)
         if entry_price is not None:
             is_entry = (side == "LONG" and current_close <= entry_price) or (
                 side == "SHORT" and current_close >= entry_price
@@ -152,7 +131,7 @@ def check_full_strategy(symbol, data, state):
                 )
                 symbol_state["alert_entry"] = True
 
-        # 3. เช็กราคา TAKE PROFIT (TP)
+        # 3. เช็กราคา Take Profit (TP)
         if tp_price is not None:
             is_tp = (side == "LONG" and current_close >= tp_price) or (
                 side == "SHORT" and current_close <= tp_price
@@ -165,7 +144,7 @@ def check_full_strategy(symbol, data, state):
                 )
                 symbol_state["alert_tp"] = True
 
-        # 4. เช็กราคา STOP LOSS (SL)
+        # 4. เช็กราคา Stop Loss (SL)
         if sl_price is not None:
             is_sl = (side == "LONG" and current_close <= sl_price) or (
                 side == "SHORT" and current_close >= sl_price
@@ -178,7 +157,7 @@ def check_full_strategy(symbol, data, state):
                 )
                 symbol_state["alert_sl"] = True
 
-        # อัปเดตสถานะล่าสุดเก็บไว้
+        # อัปเดตสถานะล่าสุด
         symbol_state["color"] = current_color
         state[symbol] = symbol_state
 
@@ -190,7 +169,6 @@ def check_full_strategy(symbol, data, state):
 
 
 def get_daily_summary(watchlist):
-    """สร้างข้อความรายงานสรุปราคาหุ้นประจำรอบ"""
     summary_msgs = []
     tz = pytz.timezone("Asia/Bangkok")
     now_str = datetime.now(tz).strftime("%d/%m/%Y %H:%M")
@@ -200,6 +178,8 @@ def get_daily_summary(watchlist):
     )
 
     for symbol, data in watchlist.items():
+        if symbol.startswith("_"):
+            continue
         try:
             side = str(data.get("side", "LONG")).upper()
             entry_price = data.get("entry", "-")
@@ -225,34 +205,19 @@ def get_daily_summary(watchlist):
     return "\n\n".join(summary_msgs)
 
 
-def should_send_summary(current_hour, today_str):
-    """ตรวจสอบช่วงเวลาสรุปประจำวัน (06.00-08.59 น. และ 17.00-19.59 น.)"""
-    flag_file = f"summary_sent_{today_str}.txt"
-    period = None
-
-    if 6 <= current_hour < 9:
-        period = "MORNING"
-    elif 17 <= current_hour < 20:
-        period = "EVENING"
-
-    if not period:
-        return False, None
-
-    sent_periods = []
-    if os.path.exists(flag_file):
-        with open(flag_file, "r") as f:
-            sent_periods = f.read().splitlines()
-
-    if period not in sent_periods:
-        with open(flag_file, "a") as f:
-            f.write(f"{period}\n")
-        return True, period
-
-    return False, period
-
-
 if __name__ == "__main__":
-    watchlist = load_watchlist()
+    print("🚀 เริ่มต้นการทำงานบน GitHub Actions...")
+    record = load_jsonbin_data()
+
+    # แยก Watchlist และส่วนเก็บ State ออกจากกัน
+    if "watchlist" in record and isinstance(record["watchlist"], dict):
+        watchlist = record["watchlist"]
+    else:
+        watchlist = {k: v for k, v in record.items() if not k.startswith("_")}
+
+    state = record.get("_state", {})
+    summary_tracker = record.get("_summary_tracker", {})
+
     print(f"📌 ดึง Watchlist ได้ทั้งหมด: {len(watchlist)} รายการ")
 
     if watchlist:
@@ -261,20 +226,29 @@ if __name__ == "__main__":
         current_hour = now.hour
         today_str = now.strftime("%Y-%m-%d")
 
-        print(f"⏰ เวลาปัจจุบัน (Bangkok): {now.strftime('%H:%M:%S')}")
+        print(f"⏰ เวลาปัจจุบัน (Bangkok): {now.strftime('%H:%M:%S (%d/%m/%Y)')}")
 
-        # 1. ส่งรายงานสรุปประจำรอบ (เช้า/เย็น)
-        send_flag, period_name = should_send_summary(current_hour, today_str)
-        if send_flag:
-            print(f"📢 กำลังส่งรายงานสรุปหุ้นประจำรอบช่วงเวลา ({period_name})...")
-            summary_text = get_daily_summary(watchlist)
-            send_msg(summary_text)
+        # 1. เช็กการส่งรายงานสรุปประจำรอบ (เช้า 06.00-08.59 น. / เย็น 17.00-19.59 น.)
+        period = None
+        if 6 <= current_hour < 9:
+            period = "MORNING"
+        elif 17 <= current_hour < 20:
+            period = "EVENING"
+
+        if period:
+            last_sent_date = summary_tracker.get(period)
+            if last_sent_date != today_str:
+                print(f"📢 กำลังส่งรายงานสรุปหุ้นประจำรอบช่วงเวลา ({period})...")
+                summary_text = get_daily_summary(watchlist)
+                send_msg(summary_text)
+                summary_tracker[period] = today_str
+                record["_summary_tracker"] = summary_tracker
 
         # 2. สแกนราคาหุ้นทุกตัว
-        state = load_color_state()
         print(f"🔍 กำลังสแกนราคาหุ้นจำนวน {len(watchlist)} ตัว...")
-
         for symbol, data in watchlist.items():
+            if symbol.startswith("_"):
+                continue
             res = check_full_strategy(symbol, data, state)
             if res:
                 send_msg(res)
@@ -282,9 +256,11 @@ if __name__ == "__main__":
             else:
                 print(f"ℹ️ หุ้น {symbol}: ไม่มีเงื่อนไขแจ้งเตือนใหม่")
 
-        # บันทึกสถานะล่าสุด
-        save_color_state(state)
+        # บันทึก State กลับขึ้น JSONBin เพื่อใช้ต่อในรอบหน้า
+        record["_state"] = state
+        save_jsonbin_data(record)
+        print("🎉 สแกนเรียบร้อย จบการทำงาน!")
     else:
         print(
-            "❌ ไม่พบรายชื่อหุ้นใน Cloud หรือดึงข้อมูล JSONBin ไม่สำเร็จ (ตรวจสอบ API Keys)"
+            "❌ ไม่พบรายชื่อหุ้นใน Cloud หรือดึงข้อมูล JSONBin ไม่สำเร็จ (ตรวจสอบ Key หรือ Bin ID)"
         )
